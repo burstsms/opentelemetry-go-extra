@@ -27,12 +27,17 @@ var (
 	logTemplateKey = attribute.Key("log.template")
 )
 
+// SetTraceFieldsFunc is a callback function that can be used to add additional fields to the log
+// from the given span context
+type SetTraceFieldsFunc func(trace.SpanContext) []zapcore.Field
+
 // Logger is a thin wrapper for zap.Logger that adds Ctx method.
 type Logger struct {
 	*zap.Logger
 	skipCaller *zap.Logger
 
-	withTraceID bool
+	withTraceID        bool
+	setTraceFieldsFunc SetTraceFieldsFunc
 
 	minLevel         zapcore.Level
 	errorStatusLevel zapcore.Level
@@ -169,8 +174,13 @@ func (l *Logger) logFields(
 	l.log(span, lvl, msg, attrs)
 
 	if l.withTraceID {
-		traceID := span.SpanContext().TraceID().String()
+		spanCtx := span.SpanContext()
+		traceID := spanCtx.TraceID().String()
 		fields = append(fields, zap.String("trace_id", traceID))
+	}
+
+	if l.setTraceFieldsFunc != nil {
+		fields = append(fields, l.setTraceFieldsFunc(span.SpanContext())...)
 	}
 
 	return fields
