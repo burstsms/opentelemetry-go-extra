@@ -19,6 +19,7 @@ import (
 )
 
 type Test struct {
+	options []otelgorm.Option
 	do      func(ctx context.Context, db *gorm.DB)
 	require func(t *testing.T, spans []sdktrace.ReadOnlySpan)
 }
@@ -26,6 +27,7 @@ type Test struct {
 func TestEndToEnd(t *testing.T) {
 	tests := []Test{
 		{
+			options: []otelgorm.Option{},
 			do: func(ctx context.Context, db *gorm.DB) {
 				var num int
 				err := db.WithContext(ctx).Raw("SELECT 42").Scan(&num).Error
@@ -48,6 +50,7 @@ func TestEndToEnd(t *testing.T) {
 			},
 		},
 		{
+			options: []otelgorm.Option{},
 			do: func(ctx context.Context, db *gorm.DB) {
 				var num int
 				_ = db.WithContext(ctx).Raw("SELECT foo_bar").Scan(&num).Error
@@ -72,6 +75,40 @@ func TestEndToEnd(t *testing.T) {
 				require.Equal(t, "SELECT foo_bar", stmt.AsString())
 			},
 		},
+		{
+			options: []otelgorm.Option{},
+			do: func(ctx context.Context, db *gorm.DB) {
+				db.WithContext(ctx).Session(&gorm.Session{DryRun: true}).Exec("SELECT 1")
+			},
+			require: func(t *testing.T, spans []sdktrace.ReadOnlySpan) {
+				require.Equal(t, 0, len(spans))
+			},
+		},
+		{
+			options: []otelgorm.Option{otelgorm.WithDryRunTx()},
+			do: func(ctx context.Context, db *gorm.DB) {
+				db.WithContext(ctx).Session(&gorm.Session{DryRun: true}).Exec("SELECT 1")
+			},
+			require: func(t *testing.T, spans []sdktrace.ReadOnlySpan) {
+				require.Equal(t, 1, len(spans))
+			},
+		},
+		{
+			do: func(ctx context.Context, db *gorm.DB) {
+				var count int64
+				query := db.WithContext(ctx).Table("generate_series(1, 10)")
+				_, _ = query.Select("*").Rows()
+				_ = query.Count(&count)
+			},
+			require: func(t *testing.T, spans []sdktrace.ReadOnlySpan) {
+				require.Equal(t, 2, len(spans))
+				require.Equal(
+					t,
+					spans[0].Parent().SpanID().String(),
+					spans[1].Parent().SpanID().String(),
+				)
+			},
+		},
 	}
 
 	for i, test := range tests {
@@ -82,7 +119,9 @@ func TestEndToEnd(t *testing.T) {
 			db, err := gorm.Open(sqlite.Open("file::memory:?cache=shared"), &gorm.Config{})
 			require.NoError(t, err)
 
-			err = db.Use(otelgorm.NewPlugin(otelgorm.WithTracerProvider(provider)))
+			options := []otelgorm.Option{otelgorm.WithTracerProvider(provider)}
+			options = append(options, test.options...)
+			err = db.Use(otelgorm.NewPlugin(options...))
 			require.NoError(t, err)
 
 			test.do(context.TODO(), db)

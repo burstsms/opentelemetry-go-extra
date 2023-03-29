@@ -47,6 +47,7 @@ type Logger struct {
 
 	// extraFields contains a number of zap.Fields that are added to every log entry
 	extraFields []zap.Field
+	callerDepth int
 }
 
 func New(logger *zap.Logger, opts ...Option) *Logger {
@@ -57,6 +58,7 @@ func New(logger *zap.Logger, opts ...Option) *Logger {
 		minLevel:         zap.WarnLevel,
 		errorStatusLevel: zap.ErrorLevel,
 		caller:           true,
+		callerDepth:      0,
 	}
 	for _, opt := range opts {
 		opt(l)
@@ -144,6 +146,10 @@ func (l *Logger) FatalContext(ctx context.Context, msg string, fields ...zapcore
 func (l *Logger) logFields(
 	ctx context.Context, lvl zapcore.Level, msg string, fields []zapcore.Field,
 ) []zapcore.Field {
+	if len(l.extraFields) > 0 {
+		fields = append(fields, l.extraFields...)
+	}
+
 	if lvl < l.minLevel {
 		return fields
 	}
@@ -153,17 +159,9 @@ func (l *Logger) logFields(
 		return fields
 	}
 
-	attrs := make([]attribute.KeyValue, 0, numAttr+len(fields)+len(l.extraFields))
+	attrs := make([]attribute.KeyValue, 0, numAttr+len(fields))
 
 	for _, f := range fields {
-		if f.Type == zapcore.NamespaceType {
-			// should this be a prefix?
-			continue
-		}
-		attrs = appendField(attrs, f)
-	}
-
-	for _, f := range l.extraFields {
 		if f.Type == zapcore.NamespaceType {
 			// should this be a prefix?
 			continue
@@ -193,7 +191,7 @@ func (l *Logger) log(
 	attrs = append(attrs, logMessageKey.String(msg))
 
 	if l.caller {
-		if fn, file, line, ok := runtimeCaller(4); ok {
+		if fn, file, line, ok := runtimeCaller(4 + l.callerDepth); ok {
 			if fn != "" {
 				attrs = append(attrs, semconv.CodeFunctionKey.String(fn))
 			}
@@ -365,21 +363,24 @@ func (s *SugaredLogger) Desugar() *Logger {
 // and the second as the field value.
 //
 // For example,
-//   sugaredLogger.With(
-//     "hello", "world",
-//     "failure", errors.New("oh no"),
-//     Stack(),
-//     "count", 42,
-//     "user", User{Name: "alice"},
-//  )
+//
+//	 sugaredLogger.With(
+//	   "hello", "world",
+//	   "failure", errors.New("oh no"),
+//	   Stack(),
+//	   "count", 42,
+//	   "user", User{Name: "alice"},
+//	)
+//
 // is the equivalent of
-//   unsugared.With(
-//     String("hello", "world"),
-//     String("failure", "oh no"),
-//     Stack(),
-//     Int("count", 42),
-//     Object("user", User{Name: "alice"}),
-//   )
+//
+//	unsugared.With(
+//	  String("hello", "world"),
+//	  String("failure", "oh no"),
+//	  Stack(),
+//	  Int("count", 42),
+//	  Object("user", User{Name: "alice"}),
+//	)
 //
 // Note that the keys in key-value pairs should be strings. In development,
 // passing a non-string key panics. In production, the logger is more
@@ -389,6 +390,7 @@ func (s *SugaredLogger) Desugar() *Logger {
 func (s *SugaredLogger) With(args ...interface{}) *SugaredLogger {
 	return &SugaredLogger{
 		SugaredLogger: s.SugaredLogger.With(args...),
+		skipCaller:    s.skipCaller,
 		l:             s.l,
 	}
 }
@@ -461,6 +463,15 @@ func (s *SugaredLogger) logArgs(
 	s.l.log(span, lvl, fmt.Sprintf(template, args...), attrs)
 }
 
+// Debugw logs a message with some additional context. The variadic key-value
+// pairs are treated as they are in With.
+func (s *SugaredLogger) DebugwContext(
+	ctx context.Context, msg string, keysAndValues ...interface{},
+) {
+	keysAndValues = s.logKVs(ctx, zap.DebugLevel, msg, keysAndValues)
+	s.Debugw(msg, keysAndValues...)
+}
+
 // Infow logs a message with some additional context. The variadic key-value
 // pairs are treated as they are in With.
 func (s *SugaredLogger) InfowContext(
@@ -529,7 +540,7 @@ func (s *SugaredLogger) logKVs(
 
 	attrs := make([]attribute.KeyValue, 0, numAttr+len(kvs))
 
-	for i := 0; i < len(kvs); i += 2 {
+	for i := 0; i < len(kvs)-1; i += 2 {
 		if key, ok := kvs[i].(string); ok {
 			attrs = append(attrs, otelutil.Attribute(key, kvs[i+1]))
 		}
@@ -556,8 +567,11 @@ type SugaredLoggerWithCtx struct {
 // is quite inexpensive, so it's reasonable for a single application to use
 // both Loggers and SugaredLoggers, converting between them on the boundaries
 // of performance-sensitive code.
-func (s SugaredLoggerWithCtx) Desugar() *Logger {
-	return s.s.Desugar()
+func (s SugaredLoggerWithCtx) Desugar() LoggerWithCtx {
+	return LoggerWithCtx{
+		ctx: s.ctx,
+		l:   s.s.Desugar(),
+	}
 }
 
 // Debugf uses fmt.Sprintf to log a templated message.
@@ -607,30 +621,31 @@ func (s SugaredLoggerWithCtx) Fatalf(template string, args ...interface{}) {
 // pairs are treated as they are in With.
 //
 // When debug-level logging is disabled, this is much faster than
-//  s.With(keysAndValues).Debug(msg)
+//
+//	s.With(keysAndValues).Debug(msg)
 func (s SugaredLoggerWithCtx) Debugw(msg string, keysAndValues ...interface{}) {
-	s.s.logKVs(s.ctx, zap.DebugLevel, msg, keysAndValues)
+	keysAndValues = s.s.logKVs(s.ctx, zap.DebugLevel, msg, keysAndValues)
 	s.s.skipCaller.Debugw(msg, keysAndValues...)
 }
 
 // Infow logs a message with some additional context. The variadic key-value
 // pairs are treated as they are in With.
 func (s SugaredLoggerWithCtx) Infow(msg string, keysAndValues ...interface{}) {
-	s.s.logKVs(s.ctx, zap.InfoLevel, msg, keysAndValues)
+	keysAndValues = s.s.logKVs(s.ctx, zap.InfoLevel, msg, keysAndValues)
 	s.s.skipCaller.Infow(msg, keysAndValues...)
 }
 
 // Warnw logs a message with some additional context. The variadic key-value
 // pairs are treated as they are in With.
 func (s SugaredLoggerWithCtx) Warnw(msg string, keysAndValues ...interface{}) {
-	s.s.logKVs(s.ctx, zap.WarnLevel, msg, keysAndValues)
+	keysAndValues = s.s.logKVs(s.ctx, zap.WarnLevel, msg, keysAndValues)
 	s.s.skipCaller.Warnw(msg, keysAndValues...)
 }
 
 // Errorw logs a message with some additional context. The variadic key-value
 // pairs are treated as they are in With.
 func (s SugaredLoggerWithCtx) Errorw(msg string, keysAndValues ...interface{}) {
-	s.s.logKVs(s.ctx, zap.ErrorLevel, msg, keysAndValues)
+	keysAndValues = s.s.logKVs(s.ctx, zap.ErrorLevel, msg, keysAndValues)
 	s.s.skipCaller.Errorw(msg, keysAndValues...)
 }
 
@@ -638,21 +653,21 @@ func (s SugaredLoggerWithCtx) Errorw(msg string, keysAndValues ...interface{}) {
 // logger then panics. (See DPanicLevel for details.) The variadic key-value
 // pairs are treated as they are in With.
 func (s SugaredLoggerWithCtx) DPanicw(msg string, keysAndValues ...interface{}) {
-	s.s.logKVs(s.ctx, zap.DPanicLevel, msg, keysAndValues)
+	keysAndValues = s.s.logKVs(s.ctx, zap.DPanicLevel, msg, keysAndValues)
 	s.s.skipCaller.DPanicw(msg, keysAndValues...)
 }
 
 // Panicw logs a message with some additional context, then panics. The
 // variadic key-value pairs are treated as they are in With.
 func (s SugaredLoggerWithCtx) Panicw(msg string, keysAndValues ...interface{}) {
-	s.s.logKVs(s.ctx, zap.PanicLevel, msg, keysAndValues)
+	keysAndValues = s.s.logKVs(s.ctx, zap.PanicLevel, msg, keysAndValues)
 	s.s.skipCaller.Panicw(msg, keysAndValues...)
 }
 
 // Fatalw logs a message with some additional context, then calls os.Exit. The
 // variadic key-value pairs are treated as they are in With.
 func (s SugaredLoggerWithCtx) Fatalw(msg string, keysAndValues ...interface{}) {
-	s.s.logKVs(s.ctx, zap.FatalLevel, msg, keysAndValues)
+	keysAndValues = s.s.logKVs(s.ctx, zap.FatalLevel, msg, keysAndValues)
 	s.s.skipCaller.Fatalw(msg, keysAndValues...)
 }
 

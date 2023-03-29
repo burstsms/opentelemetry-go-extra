@@ -1,6 +1,7 @@
 package otelgorm
 
 import (
+	"context"
 	"database/sql"
 	"database/sql/driver"
 	"fmt"
@@ -19,12 +20,13 @@ import (
 var dbRowsAffected = attribute.Key("db.rows_affected")
 
 type otelPlugin struct {
-	provider         trace.TracerProvider
-	tracer           trace.Tracer
-	attrs            []attribute.KeyValue
-	excludeQueryVars bool
-	excludeMetrics   bool
-	queryFormatter   func(query string) string
+	provider           trace.TracerProvider
+	tracer             trace.Tracer
+	attrs              []attribute.KeyValue
+	excludeQueryVars   bool
+	excludeMetrics     bool
+	includeDryRunSpans bool
+	queryFormatter     func(query string) string
 }
 
 func NewPlugin(opts ...Option) gorm.Plugin {
@@ -94,14 +96,25 @@ func (p otelPlugin) Initialize(db *gorm.DB) (err error) {
 	return firstErr
 }
 
+type parentCtxKey struct{}
+
 func (p *otelPlugin) before(spanName string) gormHookFunc {
 	return func(tx *gorm.DB) {
-		tx.Statement.Context, _ = p.tracer.Start(tx.Statement.Context, spanName, trace.WithSpanKind(trace.SpanKindClient))
+		if tx.DryRun && !p.includeDryRunSpans {
+			return
+		}
+		ctx := tx.Statement.Context
+		ctx = context.WithValue(ctx, parentCtxKey{}, ctx)
+		ctx, _ = p.tracer.Start(ctx, spanName, trace.WithSpanKind(trace.SpanKindClient))
+		tx.Statement.Context = ctx
 	}
 }
 
 func (p *otelPlugin) after() gormHookFunc {
 	return func(tx *gorm.DB) {
+		if tx.DryRun && !p.includeDryRunSpans {
+			return
+		}
 		span := trace.SpanFromContext(tx.Statement.Context)
 		if !span.IsRecording() {
 			return
@@ -146,6 +159,11 @@ func (p *otelPlugin) after() gormHookFunc {
 		default:
 			span.RecordError(tx.Error)
 			span.SetStatus(codes.Error, tx.Error.Error())
+		}
+
+		switch parentCtx := tx.Statement.Context.Value(parentCtxKey{}).(type) {
+		case context.Context:
+			tx.Statement.Context = parentCtx
 		}
 	}
 }

@@ -7,6 +7,8 @@ import (
 	"testing"
 	"time"
 
+	"go.uber.org/zap/zaptest/observer"
+
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/otel/attribute"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
@@ -270,6 +272,36 @@ func TestOtelZap(t *testing.T) {
 		},
 		{
 			log: func(ctx context.Context, log *Logger) {
+				log.Sugar().InfowContext(ctx, "hello", "foo", "bar")
+			},
+			require: func(t *testing.T, event sdktrace.Event) {
+				m := attrMap(event.Attributes)
+
+				sev, ok := m[logSeverityKey]
+				require.True(t, ok)
+				require.Equal(t, "INFO", sev.AsString())
+
+				msg, ok := m[logMessageKey]
+				require.True(t, ok)
+				require.Equal(t, "hello", msg.AsString())
+
+				foo, ok := m["foo"]
+				require.True(t, ok)
+				require.NotZero(t, foo.AsString())
+
+				requireCodeAttrs(t, m)
+			},
+		},
+		{
+			log: func(ctx context.Context, log *Logger) {
+				log.Sugar().InfowContext(ctx, "sugary logs require keyAndValues to come in pairs", "so this is invalid, but it shouldn't panic")
+			},
+			require: func(t *testing.T, event sdktrace.Event) {
+				// no panic? success!
+			},
+		},
+		{
+			log: func(ctx context.Context, log *Logger) {
 				log.Sugar().Ctx(ctx).Errorf("hello %s", "world")
 			},
 			require: func(t *testing.T, event sdktrace.Event, logs *observer.ObservedLogs) {
@@ -343,6 +375,51 @@ func TestOtelZap(t *testing.T) {
 			test.require(t, event, observedLogs)
 		})
 	}
+
+	t.Run("providing extra fields to be recorded on the span, and logged", func(t *testing.T) {
+		sr := tracetest.NewSpanRecorder()
+		provider := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(sr))
+		tracer := provider.Tracer("test")
+
+		ctx := context.Background()
+		ctx, span := tracer.Start(ctx, "main")
+
+		core, observedLogs := observer.New(zap.InfoLevel)
+		logger := New(zap.New(core), WithMinLevel(zap.InfoLevel))
+		loggerWithCtx := logger.Ctx(ctx).Clone(WithExtraFields(
+			zap.String("foo", "bar"),
+			zap.String("MyTraceIDKey", span.SpanContext().TraceID().String()),
+		))
+		loggerWithCtx.Info("hello")
+
+		span.End()
+
+		spans := sr.Ended()
+		require.Equal(t, 1, len(spans))
+
+		events := spans[0].Events()
+		require.Equal(t, 1, len(events))
+
+		event := events[0]
+		require.Equal(t, "log", event.Name)
+
+		m := attrMap(event.Attributes)
+		foo, ok := m["foo"]
+		require.True(t, ok)
+		require.Equal(t, "bar", foo.AsString())
+
+		_, ok = m["MyTraceIDKey"]
+		require.True(t, ok)
+		requireCodeAttrs(t, m)
+
+		require.Equal(t, 1, observedLogs.Len())
+		require.Equal(t, "hello", observedLogs.All()[0].Message)
+		require.Equal(t, zap.InfoLevel, observedLogs.All()[0].Level)
+
+		contextMap := observedLogs.All()[0].ContextMap()
+		require.Equal(t, "bar", contextMap["foo"])
+		require.Equal(t, span.SpanContext().TraceID().String(), contextMap["MyTraceIDKey"])
+	})
 }
 
 func requireCodeAttrs(t *testing.T, m map[attribute.Key]attribute.Value) {

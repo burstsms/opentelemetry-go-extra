@@ -3,19 +3,17 @@ package main
 import (
 	"context"
 	"fmt"
+	"log"
 	"math/rand"
 	"net/http"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	runtimemetrics "go.opentelemetry.io/contrib/instrumentation/runtime"
 	"go.opentelemetry.io/otel/exporters/prometheus"
 	"go.opentelemetry.io/otel/metric/global"
 	"go.opentelemetry.io/otel/metric/instrument"
-	"go.opentelemetry.io/otel/sdk/metric/aggregator/histogram"
-	controller "go.opentelemetry.io/otel/sdk/metric/controller/basic"
-	"go.opentelemetry.io/otel/sdk/metric/export/aggregation"
-	processor "go.opentelemetry.io/otel/sdk/metric/processor/basic"
-	selector "go.opentelemetry.io/otel/sdk/metric/selector/simple"
+	"go.opentelemetry.io/otel/sdk/metric"
 )
 
 func main() {
@@ -23,7 +21,7 @@ func main() {
 	configureOpentelemetry()
 
 	meter := global.MeterProvider().Meter("example")
-	counter, err := meter.SyncInt64().Counter(
+	counter, err := meter.Int64Counter(
 		"test.my_counter",
 		instrument.WithDescription("Just a test counter"),
 	)
@@ -40,13 +38,12 @@ func main() {
 }
 
 func configureOpentelemetry() {
-	exporter := configureMetrics()
-
 	if err := runtimemetrics.Start(); err != nil {
 		panic(err)
 	}
+	_ = configureMetrics()
 
-	http.HandleFunc("/metrics", exporter.ServeHTTP)
+	http.Handle("/metrics", promhttp.Handler())
 	fmt.Println("listenening on http://localhost:8088/metrics")
 
 	go func() {
@@ -55,24 +52,13 @@ func configureOpentelemetry() {
 }
 
 func configureMetrics() *prometheus.Exporter {
-	config := prometheus.Config{}
-
-	ctrl := controller.New(
-		processor.NewFactory(
-			selector.NewWithHistogramDistribution(
-				histogram.WithExplicitBoundaries(config.DefaultHistogramBoundaries),
-			),
-			aggregation.CumulativeTemporalitySelector(),
-			processor.WithMemory(true),
-		),
-	)
-
-	exporter, err := prometheus.New(config, ctrl)
+	exporter, err := prometheus.New()
 	if err != nil {
-		panic(err)
+		log.Fatal(err)
 	}
+	provider := metric.NewMeterProvider(metric.WithReader(exporter))
 
-	global.SetMeterProvider(exporter.MeterProvider())
+	global.SetMeterProvider(provider)
 
 	return exporter
 }
