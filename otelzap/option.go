@@ -73,9 +73,16 @@ func WithTraceIDField(on bool) Option {
 // setting further zap fields based on the span context information
 //
 // This is useful for setting stackdriver tracing information
-//
 func WithSetTraceFieldsFunc(cb SetTraceFieldsFunc) Option {
 	return func(l *Logger) {
 		l.setTraceFieldsFunc = cb
+	}
+}
+
+// WithExtractContextFunc configures the logger to run the given function on every log message to allow
+// setting further zap fields based on the current context
+func WithExtractContextFunc(cb SetContextFieldsFunc) Option {
+	return func(l *Logger) {
+		l.setContextFieldsFunc = cb
 	}
 }
